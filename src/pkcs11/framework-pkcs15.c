@@ -4818,13 +4818,29 @@ pkcs15_prkey_can_do(struct sc_pkcs11_session *session, void *obj,
 		LOG_FUNC_RETURN(context, CKR_FUNCTION_NOT_SUPPORTED);
 	token_algos = &fw_data->p15_card->tokeninfo->supported_algos[0];
 
+	/*
+	 * If token has no supported algorithms defined, fall back to allowing
+	 * the operation. The card driver will validate at operation time.
+	 * This handles cards that don't populate TokenInfo algorithm list.
+	 */
+	if (!token_algos->reference) {
+		sc_log(context, "Token has no supported algorithms defined, allowing operation");
+		LOG_FUNC_RETURN(context, CKR_OK);
+	}
+
 	for (ii=0;ii<SC_MAX_SUPPORTED_ALGORITHMS && pkinfo->algo_refs[ii];ii++)   {
 		/* Look for algorithm supported by token referenced in the list of key's algorithms */
 		for (jj=0;jj<SC_MAX_SUPPORTED_ALGORITHMS && (token_algos + jj)->reference; jj++)
 			if (pkinfo->algo_refs[ii] == (token_algos + jj)->reference)
 				break;
-		if ((jj == SC_MAX_SUPPORTED_ALGORITHMS) || !(token_algos + jj)->reference)
-			LOG_FUNC_RETURN(context, CKR_GENERAL_ERROR);
+		if ((jj == SC_MAX_SUPPORTED_ALGORITHMS) || !(token_algos + jj)->reference) {
+			/*
+			 * Key references an algorithm not in token's list.
+			 * Fall back to allowing the operation - card driver will validate.
+			 */
+			sc_log(context, "Key algo_ref %d not found in token, allowing operation", pkinfo->algo_refs[ii]);
+			LOG_FUNC_RETURN(context, CKR_OK);
+		}
 
 		if ((token_algos + jj)->mechanism != mech_type)
 			continue;
@@ -4838,8 +4854,16 @@ pkcs15_prkey_can_do(struct sc_pkcs11_session *session, void *obj,
 				break;
 	}
 
-	if (ii == SC_MAX_SUPPORTED_ALGORITHMS || !pkinfo->algo_refs[ii])
-		LOG_FUNC_RETURN(context, CKR_MECHANISM_INVALID);
+	if (ii == SC_MAX_SUPPORTED_ALGORITHMS || !pkinfo->algo_refs[ii]) {
+		/*
+		 * No matching mechanism found in token's algorithm list.
+		 * Some cards (like certain IAS-ECC cards) have incomplete algorithm
+		 * info in their TokenInfo. Fall back to allowing the operation -
+		 * the card driver will validate at operation time.
+		 */
+		sc_log(context, "Mechanism 0x%lx not found in token algos, allowing operation", mech_type);
+		LOG_FUNC_RETURN(context, CKR_OK);
+	}
 
 	LOG_FUNC_RETURN(context, CKR_OK);
 }

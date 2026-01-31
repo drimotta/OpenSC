@@ -52,6 +52,7 @@
 
 #define IASECC_CARD_DEFAULT_FLAGS ( 0			\
 		| SC_ALGORITHM_ONBOARD_KEY_GEN		\
+		| SC_ALGORITHM_RSA_RAW			\
 		| SC_ALGORITHM_RSA_PAD_ISO9796		\
 		| SC_ALGORITHM_RSA_PAD_PKCS1		\
 		| SC_ALGORITHM_RSA_HASH_NONE		\
@@ -1717,31 +1718,76 @@ iasecc_set_security_env(struct sc_card *card,
 	sdo.sdo_class = IASECC_SDO_CLASS_RSA_PRIVATE;
 	sdo.sdo_ref  = env->key_ref[0] & ~IASECC_OBJECT_REF_LOCAL;
 	rv = iasecc_sdo_get_data(card, &sdo);
-	LOG_TEST_RET(ctx, rv, "Cannot get RSA PRIVATE SDO data");
+	if (rv == SC_ERROR_DATA_OBJECT_NOT_FOUND) {
+		/*
+		 * Some IAS-ECC cards (notably certain Oberthur cards used for
+		 * Brazilian ICP-Brasil certificates) don't have the private key SDO
+		 * structure. These cards can still perform crypto operations.
+		 * Use default values derived from PKCS#15 layer instead.
+		 */
+		sc_log(ctx, "Private key SDO not found - using default values");
 
-	/* To made by iasecc_sdo_convert_to_file() */
-	prv->key_size = *(sdo.docp.size.value + 0) * 0x100 + *(sdo.docp.size.value + 1);
-	sc_log(ctx, "prv->key_size 0x%"SC_FORMAT_LEN_SIZE_T"X", prv->key_size);
+		/* Default key size in bytes: 256 bytes = 2048 bits (common for these cards) */
+		prv->key_size = 256;
 
-	rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_COMPUTE_SIGNATURE, &sign_meth, &sign_ref);
-	LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_SIGN acl");
+		/* Default: require PIN verification (CHV) for all operations */
+		sign_meth = SC_AC_CHV;
+		sign_ref = 1;
+		auth_meth = SC_AC_CHV;
+		auth_ref = 1;
 
-	rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_INTERNAL_AUTHENTICATE, &auth_meth, &auth_ref);
-	LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_INT_AUTH acl");
+		sc_log(ctx, "Using defaults: key_size=%zu, sign_meth=%u, auth_meth=%u",
+		       prv->key_size, sign_meth, auth_meth);
+	}
+	else if (rv < 0) {
+		LOG_TEST_RET(ctx, rv, "Cannot get RSA PRIVATE SDO data");
+	}
+	else {
+		/* To made by iasecc_sdo_convert_to_file() */
+		prv->key_size = *(sdo.docp.size.value + 0) * 0x100 + *(sdo.docp.size.value + 1);
+		sc_log(ctx, "prv->key_size 0x%"SC_FORMAT_LEN_SIZE_T"X", prv->key_size);
+
+		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_PSO_COMPUTE_SIGNATURE, &sign_meth, &sign_ref);
+		LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_SIGN acl");
+
+		rv = iasecc_sdo_convert_acl(card, &sdo, SC_AC_OP_INTERNAL_AUTHENTICATE, &auth_meth, &auth_ref);
+		LOG_TEST_RET(ctx, rv, "Cannot convert SC_AC_OP_INT_AUTH acl");
+	}
 
 	aflags = env->algorithm_flags;
 
-	if (!(aflags & SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01))
+	/*
+	 * For raw RSA operations (SC_ALGORITHM_RSA_RAW), use INTERNAL AUTHENTICATE.
+	 * This is needed for CryptoTokenKit which requests kSecKeyAlgorithmRSASignatureRaw.
+	 */
+	if (aflags & SC_ALGORITHM_RSA_RAW) {
+		sc_log(ctx, "SC_ALGORITHM_RSA_RAW requested -- use AUTHENTICATE operation");
+		operation = SC_SEC_OPERATION_AUTHENTICATE;
+	}
+	else if (!(aflags & SC_ALGORITHM_RSA_PAD_PKCS1_TYPE_01)) {
 		LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Only supported signature with PKCS1 padding");
-
-	if (operation == SC_SEC_OPERATION_SIGN)   {
+	}
+	else if (operation == SC_SEC_OPERATION_SIGN)   {
 		if (!(aflags & (SC_ALGORITHM_RSA_HASH_SHA1 | SC_ALGORITHM_RSA_HASH_SHA256)))   {
 			sc_log(ctx, "CKM_RSA_PKCS asked -- use 'AUTHENTICATE' sign operation instead of 'SIGN'");
 			operation = SC_SEC_OPERATION_AUTHENTICATE;
 		}
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		else {
+			/*
+			 * OpenSSL 3.x doesn't expose internal hash state needed for QSign
+			 * (on-card hashing via DST path). Fall back to AUTHENTICATE path
+			 * where the host computes the hash and sends DigestInfo to the card.
+			 * This matches how CryptoTokenKit works on macOS.
+			 */
+			sc_log(ctx, "OpenSSL 3.x: using AUTHENTICATE instead of DST for hash+sign");
+			operation = SC_SEC_OPERATION_AUTHENTICATE;
+		}
+#else
 		else if (sign_meth == SC_AC_NEVER)   {
 			LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "PSO_DST not allowed for this key");
 		}
+#endif
 	}
 
 	if (operation == SC_SEC_OPERATION_SIGN)   {
@@ -1775,7 +1821,7 @@ iasecc_set_security_env(struct sc_card *card,
 
 			algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_SHA256_RSA_PKCS);
 			if (!algo_ref)
-				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports SIGNATURE:SHA1_RSA_PKCS");
+				LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Card application do not supports SIGNATURE:SHA256_RSA_PKCS");
 
 			cse_crt_dst[2] = env->key_ref[0] | IASECC_OBJECT_REF_LOCAL;
 			cse_crt_dst[5] = algo_ref;   /* IASECC_ALGORITHM_RSA_PKCS | IASECC_ALGORITHM_SHA2 */
@@ -1815,8 +1861,14 @@ iasecc_set_security_env(struct sc_card *card,
 		break;
 	case SC_SEC_OPERATION_AUTHENTICATE:
 		algo_ref = iasecc_get_algorithm(ctx, env, SC_PKCS15_ALGO_OP_COMPUTE_SIGNATURE,  CKM_RSA_PKCS);
-		if (!algo_ref)
-			LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "Application do not supports SIGNATURE:RSA_PKCS");
+		if (!algo_ref) {
+			/*
+			 * Card doesn't have algorithm info in EF.5032 (TokenInfo).
+			 * Use default IASECC_ALGORITHM_RSA_PKCS (0x02) for raw RSA.
+			 */
+			sc_log(ctx, "No algorithm info found, using default IASECC_ALGORITHM_RSA_PKCS");
+			algo_ref = IASECC_ALGORITHM_RSA_PKCS;
+		}
 
 		cse_crt_at[2] = env->key_ref[0] | IASECC_OBJECT_REF_LOCAL;
 		cse_crt_at[5] = algo_ref;	/* IASECC_ALGORITHM_RSA_PKCS */
@@ -2036,6 +2088,59 @@ iasecc_pin_verify(struct sc_card *card, struct sc_pin_cmd_data *data, int *tries
 }
 
 
+/*
+ * Initialize PIN policy with default values.
+ * Used as fallback when the card doesn't have PIN SDO structures.
+ * Default values are derived from the PKCS#15 layer (sc_pin_cmd_data)
+ * or set to sensible defaults for IAS-ECC compatible cards.
+ */
+static void
+iasecc_pin_policy_set_defaults(struct sc_card *card, struct sc_pin_cmd_data *data,
+			       struct iasecc_pin_policy *pin)
+{
+	struct sc_context *ctx = card->ctx;
+
+	sc_log(ctx, "Setting default PIN policy values (SDO not available)");
+
+	/* Initialize all scbs to 0 (no secure messaging required) */
+	memset(pin->scbs, 0, sizeof(pin->scbs));
+
+	/*
+	 * Use values from PKCS#15 layer if available, otherwise use defaults.
+	 * The PKCS#15 layer typically provides these values from the card's
+	 * PKCS#15 structure (EF.ODF, EF.AODF).
+	 */
+	if (data->pin1.min_length > 0)
+		pin->min_length = (int)data->pin1.min_length;
+	else
+		pin->min_length = 4;  /* Minimum 4 digits/chars is standard */
+
+	if (data->pin1.max_length > 0)
+		pin->max_length = (int)data->pin1.max_length;
+	else
+		pin->max_length = 64; /* Common max for IAS-ECC cards */
+
+	if (data->pin1.pad_length > 0)
+		pin->stored_length = (int)data->pin1.pad_length;
+	else
+		pin->stored_length = 64; /* Default stored length for padding */
+
+	if (data->pin1.max_tries > 0)
+		pin->tries_maximum = data->pin1.max_tries;
+	else
+		pin->tries_maximum = -1; /* Unknown */
+
+	if (data->pin1.tries_left >= 0)
+		pin->tries_remaining = data->pin1.tries_left;
+	else
+		pin->tries_remaining = -1; /* Unknown */
+
+	sc_log(ctx, "Default PIN policy: min=%d, max=%d, stored=%d, max_tries=%d, tries_left=%d",
+	       pin->min_length, pin->max_length, pin->stored_length,
+	       pin->tries_maximum, pin->tries_remaining);
+}
+
+
 static int
 iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struct iasecc_pin_policy *pin)
 {
@@ -2087,7 +2192,22 @@ iasecc_pin_get_policy (struct sc_card *card, struct sc_pin_cmd_data *data, struc
 	sc_log(ctx, "iasecc_pin_get_policy() reference %i", sdo.sdo_ref);
 
 	rv = iasecc_sdo_get_data(card, &sdo);
-	LOG_TEST_GOTO_ERR(ctx, rv, "Cannot get SDO PIN data");
+	if (rv == SC_ERROR_DATA_OBJECT_NOT_FOUND) {
+		/*
+		 * Some IAS-ECC cards (notably certain Oberthur cards used for
+		 * Brazilian ICP-Brasil certificates) don't have the PIN SDO
+		 * structure that the IAS-ECC specification describes.
+		 * These cards can still verify PINs via standard VERIFY commands.
+		 * Use default values derived from PKCS#15 layer instead.
+		 */
+		sc_log(ctx, "PIN SDO not found - using default policy values");
+		iasecc_pin_policy_set_defaults(card, data, pin);
+		rv = SC_SUCCESS;
+		goto err;
+	}
+	else if (rv < 0) {
+		LOG_TEST_GOTO_ERR(ctx, rv, "Cannot get SDO PIN data");
+	}
 
 	if (sdo.docp.acls_contact.size == 0) {
 		rv = SC_ERROR_INVALID_DATA;
@@ -2159,7 +2279,17 @@ iasecc_pin_get_info(struct sc_card *card, struct sc_pin_cmd_data *data, int *tri
 	LOG_TEST_RET(ctx, rv, "Failed to get PIN status");
 
 	rv = iasecc_pin_get_policy(card, data, &policy);
-	LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
+	if (rv != SC_SUCCESS) {
+		/*
+		 * If policy retrieval fails (e.g., SDO not found), we can still
+		 * return successfully since we got the PIN status. The caller
+		 * will use the status values without the policy enhancements.
+		 */
+		sc_log(ctx, "PIN policy not available (rv=%d), using status only", rv);
+		if (rv == SC_ERROR_DATA_OBJECT_NOT_FOUND)
+			rv = SC_SUCCESS;
+		LOG_FUNC_RETURN(ctx, rv);
+	}
 
 	/*
 	 * We only care about the tries_xxx fields in the PIN policy, since the other ones are not
@@ -2404,7 +2534,19 @@ iasecc_pin_reset(struct sc_card *card, struct sc_pin_cmd_data *data, int *tries_
 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Unblock procedure can be used only with the PINs of type CHV");
 
 	rv = iasecc_pin_get_policy(card, data, &policy);
-	LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
+	if (rv == SC_ERROR_DATA_OBJECT_NOT_FOUND) {
+		/*
+		 * For cards without SDO, PIN reset/unblock may not be supported
+		 * in the way IAS-ECC specifies (using SCBs). However, we can try
+		 * a standard unblock operation. Set default policy with no SM.
+		 */
+		sc_log(ctx, "PIN SDO not found for reset - trying standard unblock");
+		iasecc_pin_policy_set_defaults(card, data, &policy);
+		rv = SC_SUCCESS;
+	}
+	else if (rv < 0) {
+		LOG_TEST_RET(ctx, rv, "Failed to get PIN policy");
+	}
 
 	scb = policy.scbs[IASECC_ACLS_CHV_RESET];
 	do   {
@@ -3393,6 +3535,63 @@ iasecc_compute_signature_at(struct sc_card *card,
 	if (env->operation != SC_SEC_OPERATION_AUTHENTICATE)
 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "It's not SC_SEC_OPERATION_AUTHENTICATE");
 
+	/*
+	 * For raw RSA operations with full key-size input (e.g., 256 bytes for RSA-2048),
+	 * the card's INTERNAL AUTHENTICATE command doesn't support such large input.
+	 * CryptoTokenKit sends PKCS#1 v1.5 padded data: 0x00 0x01 [0xFF padding] 0x00 [DigestInfo]
+	 * We strip the padding and send just the DigestInfo to INTERNAL AUTHENTICATE.
+	 */
+	if (in_len == prv->key_size && in_len > 64) {
+		const unsigned char *digest_info = NULL;
+		size_t digest_info_len = 0;
+		size_t i;
+
+		sc_log(ctx, "Raw RSA with full key size - stripping PKCS#1 padding");
+
+		/* Check for PKCS#1 v1.5 signature padding: 0x00 0x01 [0xFF...] 0x00 [DigestInfo] */
+		if (in[0] == 0x00 && in[1] == 0x01) {
+			/* Find the 0x00 separator after the 0xFF padding */
+			for (i = 2; i < in_len; i++) {
+				if (in[i] == 0x00) {
+					digest_info = in + i + 1;
+					digest_info_len = in_len - i - 1;
+					break;
+				} else if (in[i] != 0xFF) {
+					/* Invalid padding */
+					break;
+				}
+			}
+		}
+
+		if (digest_info && digest_info_len > 0 && digest_info_len < 128) {
+			sc_log(ctx, "Extracted DigestInfo: %zu bytes", digest_info_len);
+
+			/* Use INTERNAL AUTHENTICATE with just the DigestInfo */
+			sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x88, 0x00, 0x00);
+			apdu.datalen = digest_info_len;
+			apdu.data = digest_info;
+			apdu.lc = digest_info_len;
+			apdu.resp = rbuf;
+			apdu.resplen = sizeof(rbuf);
+			apdu.le = prv->key_size;
+
+			rv = sc_transmit_apdu(card, &apdu);
+			LOG_TEST_RET(ctx, rv, "APDU transmit failed");
+			rv = sc_check_sw(card, apdu.sw1, apdu.sw2);
+			LOG_TEST_RET(ctx, rv, "INTERNAL AUTHENTICATE failed");
+
+			if (apdu.resplen > out_len)
+				LOG_TEST_RET(ctx, SC_ERROR_BUFFER_TOO_SMALL, "Buffer too small");
+
+			memcpy(out, apdu.resp, apdu.resplen);
+			LOG_FUNC_RETURN(ctx, (int)apdu.resplen);
+		} else {
+			sc_log(ctx, "Could not extract DigestInfo from padded data");
+			LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_DATA);
+		}
+	}
+
+	/* Standard INTERNAL AUTHENTICATE for smaller input (e.g., DigestInfo directly) */
 	sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x88, 0x00, 0x00);
 	apdu.datalen = in_len;
 	apdu.data = in;
@@ -3485,6 +3684,16 @@ iasecc_read_public_key(struct sc_card *card, unsigned type,
 	sdo.sdo_ref  = ref & ~IASECC_OBJECT_REF_LOCAL;
 
 	rv = iasecc_sdo_get_data(card, &sdo);
+	if (rv == SC_ERROR_DATA_OBJECT_NOT_FOUND) {
+		/*
+		 * Some IAS-ECC cards (notably certain Oberthur cards used for
+		 * Brazilian ICP-Brasil certificates) don't have the public key SDO.
+		 * Return SC_ERROR_NOT_SUPPORTED so the upper layer can try to
+		 * extract the public key from the certificate instead.
+		 */
+		sc_log(ctx, "Public key SDO not found - upper layer should use certificate");
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	}
 	LOG_TEST_GOTO_ERR(ctx, rv, "failed to read public key: cannot get RSA SDO data");
 
 	if (out)

@@ -976,12 +976,21 @@ sc_pkcs15_read_pubkey(struct sc_pkcs15_card *p15card, const struct sc_pkcs15_obj
 		r = p15card->card->ops->read_public_key(p15card->card, algorithm,
 				(struct sc_path *)&info->path, info->key_reference, (unsigned)info->modulus_length,
 				&data, &len);
+		if (r == SC_ERROR_NOT_SUPPORTED && info->path.len) {
+			/*
+			 * Card driver doesn't support reading public key directly
+			 * (e.g., no public key SDO). Try reading from file path instead.
+			 */
+			sc_log(ctx, "Card read_public_key not supported, trying file path fallback");
+			goto try_path_fallback;
+		}
 		LOG_TEST_GOTO_ERR(ctx, r, "Card specific 'read-public' procedure failed.");
 
 		r = sc_pkcs15_decode_pubkey(ctx, pubkey, data, len);
 		LOG_TEST_GOTO_ERR(ctx, r, "Decode public key error");
 	}
 	else if (info->path.len)   {
+try_path_fallback:
 		sc_log(ctx, "Read from EF and decode");
 		private_obj = obj->flags & SC_PKCS15_CO_FLAG_PRIVATE;
 		r = sc_pkcs15_read_file(p15card, &info->path, &data, &len, private_obj);
